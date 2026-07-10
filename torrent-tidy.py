@@ -262,6 +262,7 @@ def main():
     logged_in = False
 
     while True:
+        sleep_seconds = CHECK_INTERVAL
         try:
             if not logged_in:
                 try:
@@ -269,7 +270,7 @@ def main():
                     logged_in = True
                 except Exception:
                     log.exception("Failed to login to qBittorrent API, will retry...")
-                    time.sleep(LOGIN_RETRY_DELAY)
+                    sleep_seconds = LOGIN_RETRY_DELAY
                     continue
 
             known_download_ids = get_known_download_ids()
@@ -346,7 +347,7 @@ def main():
             log.exception("Unexpected error, will retry...")
 
         finally:
-            time.sleep(CHECK_INTERVAL)
+            time.sleep(sleep_seconds)
 
 if __name__ == "__main__":
     main()
