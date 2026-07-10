@@ -57,7 +57,7 @@ Good practice guidance:
 
 ### Important Environment Variables
 
-- `QB_API`, `QB_USERNAME`, `QB_PASSWORD` qbittorrent creds and api location
+- `QB_API_TT`, `QB_USERNAME`, `QB_PASSWORD` qbittorrent creds and api location
 - `SONARR_API`, `SONARR_API_KEY` same for sonarr
 - `RADARR_API`, `RADARR_API_KEY` same for radarr
 - `CHECK_INTERVAL` in seconds (default `43200`, i.e. twice daily)
@@ -70,3 +70,5 @@ Good practice guidance:
 ### Recommended First Run
 
 Run with `DRY_RUN=true` first, review logs, then set `DRY_RUN=false` once behavior matches what you expect.
+
+If qBittorrent runs with `network_mode: service:gluetun`, set `QB_API_TT` to `http://gluetun:8080` from the torrent-tidy container.

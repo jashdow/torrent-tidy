@@ -37,7 +37,7 @@ def env_list(name, default):
     return [item.strip().lower() for item in value.split(",") if item.strip()]
 
 
-QB_API = os.environ["QB_API"].rstrip("/")
+QB_API = os.environ["QB_API_TT"].rstrip("/")
 QB_USERNAME = os.environ["QB_USERNAME"]
 QB_PASSWORD = os.environ["QB_PASSWORD"]
 
