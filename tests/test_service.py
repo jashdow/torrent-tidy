@@ -1,6 +1,11 @@
 import tempfile
+import os
+import sys
 
 import pytest
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+
 from service import should_delete_torrent, sync_history_state
 from state import StateStore
 

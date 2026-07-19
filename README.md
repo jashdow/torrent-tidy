@@ -87,6 +87,8 @@ Compatibility note: if you still set `STATE_FILE`, it is used as a fallback stat
 Install test dependencies and run pytest:
 
 ```bash
+python3 -m venv .venv
+source .venv/bin/activate
 pip install -r requirements-dev.txt
 pytest
 ```
