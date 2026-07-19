@@ -282,6 +282,10 @@ def run(config):
 
             processed = 0
             deleted = 0
+            tracked_count = 0
+            orphan_count = 0
+            orphan_under_limits_count = 0
+            orphan_over_limits_count = 0
 
             for torrent in torrent_list:
                 torrent_hash = (torrent.get("hash") or "").lower()
@@ -311,6 +315,15 @@ def run(config):
                     config.seeding_time_limit_seconds,
                 )
                 processed += 1
+
+                if torrent_hash in known_download_ids:
+                    tracked_count += 1
+                else:
+                    orphan_count += 1
+                    if should_delete:
+                        orphan_over_limits_count += 1
+                    else:
+                        orphan_under_limits_count += 1
 
                 if not should_delete:
                     continue
@@ -348,9 +361,13 @@ def run(config):
                     log.warning("Failed to delete %s (%s): %s", name, torrent_hash, e)
 
             log.info(
-                "Cycle complete: processed=%d completed torrents, matched_ids=%d, candidates=%d",
+                "Cycle complete: processed=%d known_ids_total=%d tracked=%d orphaned=%d orphan_under_limits=%d orphan_over_limits=%d candidates=%d",
                 processed,
                 len(known_download_ids),
+                tracked_count,
+                orphan_count,
+                orphan_under_limits_count,
+                orphan_over_limits_count,
                 deleted,
             )
 
