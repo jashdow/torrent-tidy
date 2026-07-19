@@ -33,6 +33,8 @@ services:
     restart: unless-stopped
     env_file:
       - ./torrent-tidy/.env
+    volumes:
+      - ./torrent-tidy/state:/data
 ```
 
 ### Environment File Strategy
@@ -61,6 +63,9 @@ Good practice guidance:
 - `SONARR_API`, `SONARR_API_KEY` same for sonarr
 - `RADARR_API`, `RADARR_API_KEY` same for radarr
 - `CHECK_INTERVAL` in seconds (default `43200`, i.e. twice daily)
+- `HISTORY_PAGE_SIZE`, `HISTORY_MAX_PAGES` bootstrap paging controls for first full history sync
+- `HISTORY_SINCE_OVERLAP_SECONDS` overlap buffer for incremental `history/since` calls
+- `STATE_DB_PATH` local SQLite state path for persisted incremental sync cursor (default `/tmp/torrent-tidy-state.db`)
 - `SEEDING_TIME_LIMIT_HOURS` (default `720`, i.e. 30 days)
 - `RATIO_LIMIT` (default `2.0`)
 - `CATEGORY_FILTER` (default `["radarr","tv-sonarr"]`, accepts JSON array or CSV), only torrents of this category will be deleted
@@ -72,3 +77,7 @@ Good practice guidance:
 Run with `DRY_RUN=true` first, review logs, then set `DRY_RUN=false` once behavior matches what you expect.
 
 If qBittorrent runs with `network_mode: service:gluetun`, set `QB_API_TT` to `http://gluetun:8080` from the torrent-tidy container.
+
+The service now uses incremental Sonarr/Radarr history syncing via `history/since`. Persist `STATE_DB_PATH` on a volume to avoid repeating full-history bootstrap after restarts.
+
+Compatibility note: if you still set `STATE_FILE`, it is used as a fallback state DB path for backward compatibility.
