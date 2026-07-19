@@ -96,7 +96,12 @@ def test_keeps_when_orphaned_but_under_limits(torrent):
 
 def test_incremental_history_updates_state(state_store):
     # Existing state before this run.
-    state_store.write_state("sonarr", {"aaa", "bbb"}, 100.0)
+    state_store.write_state(
+        "sonarr",
+        {"aaa", "bbb"},
+        {"aaa": "title-a", "bbb": "title-b"},
+        100.0,
+    )
 
     arr_client = FakeArrClient(
         responses=[
@@ -131,3 +136,81 @@ def test_incremental_history_updates_state(state_store):
     assert active_ids == {"aaa", "ccc"}
     assert any(path.startswith("/history/since") for path in arr_client.requests)
     assert state_store.get_last_event_time("sonarr") >= 1752919220.0
+
+
+def test_delete_event_without_download_id_uses_source_title_fallback(state_store):
+    state_store.write_state(
+        "sonarr",
+        {"aaa", "bbb"},
+        {"aaa": "show one s01e01", "bbb": "show one s01e02"},
+        100.0,
+    )
+
+    arr_client = FakeArrClient(
+        responses=[
+            (
+                "/history/since",
+                [
+                    {
+                        "downloadId": "",
+                        "eventType": "episodeFileDeleted",
+                        "sourceTitle": "Show One S01E01",
+                        "date": "2026-07-19T10:00:30Z",
+                    }
+                ],
+            )
+        ]
+    )
+
+    active_ids = sync_history_state(
+        app_name="sonarr",
+        arr_client=arr_client,
+        state_store=state_store,
+        page_size=250,
+        max_pages=40,
+        overlap_seconds=120,
+        log=_SilentLog(),
+    )
+
+    assert active_ids == {"bbb"}
+
+
+def test_delete_event_without_download_id_uses_entity_ids(state_store):
+    state_store.write_state(
+        "radarr",
+        {"aaa", "bbb"},
+        {"aaa": "movie one 2024", "bbb": "movie two 2024"},
+        100.0,
+        {
+            "aaa": {"movie:123"},
+            "bbb": {"movie:456"},
+        },
+    )
+
+    arr_client = FakeArrClient(
+        responses=[
+            (
+                "/history/since",
+                [
+                    {
+                        "downloadId": "",
+                        "eventType": "movieFileDeleted",
+                        "movieId": 123,
+                        "date": "2026-07-19T10:00:40Z",
+                    }
+                ],
+            )
+        ]
+    )
+
+    active_ids = sync_history_state(
+        app_name="radarr",
+        arr_client=arr_client,
+        state_store=state_store,
+        page_size=250,
+        max_pages=40,
+        overlap_seconds=120,
+        log=_SilentLog(),
+    )
+
+    assert active_ids == {"bbb"}

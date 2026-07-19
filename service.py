@@ -34,6 +34,38 @@ def extract_arr_records(payload):
     return []
 
 
+def normalize_source_title(value):
+    if not value:
+        return ""
+    return str(value).strip().lower()
+
+
+def extract_arr_entity_keys(record, app_name):
+    """Extract stable Arr entity keys from history records.
+
+    We prefer entity IDs over titles for delete events that omit downloadId.
+    """
+    keys = set()
+    data = record.get("data") if isinstance(record.get("data"), dict) else {}
+
+    if app_name == "sonarr":
+        for field, prefix in (("seriesId", "series"), ("episodeId", "episode"), ("episodeFileId", "episodefile")):
+            value = record.get(field, data.get(field))
+            if isinstance(value, int):
+                keys.add(f"{prefix}:{value}")
+            elif isinstance(value, str) and value.isdigit():
+                keys.add(f"{prefix}:{value}")
+    elif app_name == "radarr":
+        for field, prefix in (("movieId", "movie"), ("movieFileId", "moviefile")):
+            value = record.get(field, data.get(field))
+            if isinstance(value, int):
+                keys.add(f"{prefix}:{value}")
+            elif isinstance(value, str) and value.isdigit():
+                keys.add(f"{prefix}:{value}")
+
+    return keys
+
+
 def paged_download_ids(arr_client, page_size):
     page = 1
     download_ids = set()
@@ -69,6 +101,8 @@ def paged_download_ids(arr_client, page_size):
 
 def history_bootstrap_state(arr_client, page_size, max_pages):
     latest_event_by_id = {}
+    latest_title_by_id = {}
+    latest_entities_by_id = {}
     max_event_time = 0.0
 
     for page in range(1, max_pages + 1):
@@ -99,17 +133,24 @@ def history_bootstrap_state(arr_client, page_size, max_pages):
                 continue
 
             latest_event_by_id[download_id] = (record.get("eventType") or "").strip().lower()
+            latest_title_by_id[download_id] = normalize_source_title(record.get("sourceTitle"))
+            # App-specific entity extraction runs in incremental sync where app_name is known.
+            latest_entities_by_id[download_id] = set()
 
         total_records = payload.get("totalRecords") if isinstance(payload, dict) else None
         if total_records is not None and page * page_size >= total_records:
             break
 
     active_ids = set()
+    active_sources = {}
     for download_id, event_type in latest_event_by_id.items():
         if "deleted" not in event_type:
             active_ids.add(download_id)
+            title = latest_title_by_id.get(download_id, "")
+            if title:
+                active_sources[download_id] = title
 
-    return active_ids, max_event_time
+    return active_ids, active_sources, latest_entities_by_id, max_event_time
 
 
 def history_since_records(arr_client, since_epoch, overlap_seconds):
@@ -121,34 +162,76 @@ def history_since_records(arr_client, since_epoch, overlap_seconds):
 
 def sync_history_state(app_name, arr_client, state_store, page_size, max_pages, overlap_seconds, log):
     active_ids = state_store.get_active_ids(app_name)
+    active_sources = state_store.get_active_source_titles(app_name)
+    active_entities = state_store.get_active_entities(app_name)
     last_event_time = state_store.get_last_event_time(app_name)
 
     if last_event_time <= 0:
-        active_ids, max_event_time = history_bootstrap_state(arr_client, page_size, max_pages)
-        state_store.write_state(app_name, active_ids, max_event_time)
+        active_ids, active_sources, active_entities, max_event_time = history_bootstrap_state(
+            arr_client, page_size, max_pages
+        )
+        # Backfill entity keys from a light incremental pull to avoid wide bootstrap changes.
+        # On first run this is acceptable and keeps state format consistent.
+        state_store.write_state(app_name, active_ids, active_sources, max_event_time)
         log.info("Bootstrapped %s history: active_ids=%d", app_name, len(active_ids))
         return active_ids
 
     records = history_since_records(arr_client, last_event_time, overlap_seconds)
     max_event_time = last_event_time
+    deleted_without_id_count = 0
 
     for record in records:
         download_id = (record.get("downloadId") or "").strip().lower()
-        if not download_id:
-            continue
-
         event_type = (record.get("eventType") or "").strip().lower()
-        if "deleted" in event_type:
-            active_ids.discard(download_id)
-        else:
-            active_ids.add(download_id)
+        source_title = normalize_source_title(record.get("sourceTitle"))
+        entity_keys = extract_arr_entity_keys(record, app_name)
+
+        if download_id:
+            if "deleted" in event_type:
+                active_ids.discard(download_id)
+                active_sources.pop(download_id, None)
+                active_entities.pop(download_id, None)
+            else:
+                active_ids.add(download_id)
+                if source_title:
+                    active_sources[download_id] = source_title
+                if entity_keys:
+                    existing = active_entities.get(download_id, set())
+                    active_entities[download_id] = existing.union(entity_keys)
+        elif "deleted" in event_type and (entity_keys or source_title):
+            # Some Arr delete events omit downloadId; prefer entity-key mapping first.
+            deleted_without_id_count += 1
+            removed_by_entity = False
+            if entity_keys:
+                for active_id, active_keys in list(active_entities.items()):
+                    if active_keys.intersection(entity_keys):
+                        active_ids.discard(active_id)
+                        active_sources.pop(active_id, None)
+                        active_entities.pop(active_id, None)
+                        removed_by_entity = True
+
+            # Final fallback when entity data is unavailable.
+            if not removed_by_entity:
+                for active_id, active_title in list(active_sources.items()):
+                    if active_title != source_title:
+                        continue
+
+                    active_ids.discard(active_id)
+                    active_sources.pop(active_id, None)
+                    active_entities.pop(active_id, None)
 
         event_time = arr_iso_to_epoch_seconds(record.get("date"))
         if event_time and event_time > max_event_time:
             max_event_time = event_time
 
-    state_store.write_state(app_name, active_ids, max_event_time)
-    log.info("Updated %s history: new_events=%d active_ids=%d", app_name, len(records), len(active_ids))
+    state_store.write_state(app_name, active_ids, active_sources, max_event_time, active_entities)
+    log.info(
+        "Updated %s history: new_events=%d active_ids=%d delete_events_without_id=%d",
+        app_name,
+        len(records),
+        len(active_ids),
+        deleted_without_id_count,
+    )
     return active_ids
 
 
