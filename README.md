@@ -81,3 +81,12 @@ If qBittorrent runs with `network_mode: service:gluetun`, set `QB_API_TT` to `ht
 The service now uses incremental Sonarr/Radarr history syncing via `history/since`. Persist `STATE_DB_PATH` on a volume to avoid repeating full-history bootstrap after restarts.
 
 Compatibility note: if you still set `STATE_FILE`, it is used as a fallback state DB path for backward compatibility.
+
+### Running Tests
+
+Install test dependencies and run pytest:
+
+```bash
+pip install -r requirements-dev.txt
+pytest
+```
