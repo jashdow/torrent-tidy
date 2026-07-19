@@ -12,10 +12,17 @@ if [ "$(id -u)" -eq 0 ]; then
   fi
 
   if [ -d "$STATE_DIR" ]; then
-    chown -R "$APP_UID:$APP_GID" "$STATE_DIR" || true
+    if ! chown -R "$APP_UID:$APP_GID" "$STATE_DIR" 2>/dev/null; then
+      echo "[torrent-tidy] WARN could not chown $STATE_DIR; continuing with current ownership" >&2
+    fi
   fi
 
-  exec gosu "$APP_UID:$APP_GID" python /app/torrent-tidy.py
+  if gosu "$APP_UID:$APP_GID" true >/dev/null 2>&1; then
+    exec gosu "$APP_UID:$APP_GID" python /app/torrent-tidy.py
+  fi
+
+  echo "[torrent-tidy] WARN could not drop privileges to $APP_UID:$APP_GID; running as root" >&2
+  exec python /app/torrent-tidy.py
 fi
 
 exec python /app/torrent-tidy.py
