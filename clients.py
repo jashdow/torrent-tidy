@@ -72,9 +72,13 @@ class QbClient:
             return json.loads(resp.read().decode())
 
     def delete_torrent(self, torrent_hash, delete_files):
-        data = urllib.parse.urlencode({"hashes": torrent_hash}).encode()
-        delete_path = "/torrents/deletePerm" if delete_files else "/torrents/delete"
-        req = urllib.request.Request(self.qb_url(delete_path), data=data, method="POST")
+        data = urllib.parse.urlencode(
+            {
+                "hashes": torrent_hash,
+                "deleteFiles": "true" if delete_files else "false",
+            }
+        ).encode()
+        req = urllib.request.Request(self.qb_url("/torrents/delete"), data=data, method="POST")
         with self.opener.open(req, timeout=10) as resp:
             if resp.status != 200:
                 raise RuntimeError(
