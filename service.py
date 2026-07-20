@@ -322,16 +322,28 @@ def scene_name_from_file_record(file_record):
 
 
 def fetch_sonarr_library_names(arr_client, log):
-    """Fetch scene names for every episode file currently in the Sonarr library."""
+    """Fetch scene names and season-pack keys for everything currently in the Sonarr library.
+
+    Per-episode sceneName values only match single-episode torrent names exactly.
+    Season-pack torrents (e.g. "Show S03 1080p...") have no single matching sceneName,
+    so we also track (series_title, season_number) pairs for substring-based matching.
+    """
     names = set()
+    season_packs = set()
 
     try:
         series_payload = arr_client.fetch_json("/series")
     except Exception as e:
         log.warning("Failed to fetch Sonarr series list: %s", e)
-        return names
+        return names, season_packs
 
     series_list = series_payload if isinstance(series_payload, list) else []
+    series_titles_by_id = {}
+    for series in series_list:
+        series_id = series.get("id")
+        if isinstance(series_id, int):
+            series_titles_by_id[series_id] = normalize_release_name(series.get("title", ""))
+
     for series in series_list:
         series_id = series.get("id")
         if not isinstance(series_id, int):
@@ -349,7 +361,12 @@ def fetch_sonarr_library_names(arr_client, log):
             if normalized:
                 names.add(normalized)
 
-    return names
+            season_number = file_record.get("seasonNumber")
+            series_title = series_titles_by_id.get(series_id, "")
+            if series_title and isinstance(season_number, int):
+                season_packs.add((series_title, season_number))
+
+    return names, season_packs
 
 
 def fetch_radarr_library_names(arr_client, log):
@@ -375,19 +392,54 @@ def fetch_radarr_library_names(arr_client, log):
     return names
 
 
+def torrent_matches_season_pack(normalized_torrent_name, season_packs):
+    """Check if a torrent name matches a (series_title, season_number) currently in the library.
+
+    Uses substring matching since season-pack torrent names embed the series title and a
+    season indicator (e.g. "s03", "s3", "season 3") with other tokens (year, resolution) in
+    between, so exact/positional matching against sceneName values does not work here.
+
+    Returns the matching (series_title, season_number) pair, or None if no match.
+    """
+    if not normalized_torrent_name:
+        return None
+
+    for series_title, season_number in season_packs:
+        if not series_title or series_title not in normalized_torrent_name:
+            continue
+
+        season_patterns = (
+            f"s{season_number:02d}",
+            f"s{season_number}",
+            f"season {season_number}",
+        )
+        if any(pattern in normalized_torrent_name for pattern in season_patterns):
+            return (series_title, season_number)
+
+    return None
+
+
 def get_current_library_names(sonarr_client, radarr_client, log):
     """Fetch a fresh snapshot of release names currently present in the Sonarr/Radarr library.
 
     This is a direct, stateless comparison against current library contents, and does not
     depend on hardlinks or Arr history events, both of which have proven unreliable.
+    Returns a dict with "names" (exact per-file scene names) and "season_packs"
+    (series_title, season_number) pairs for season-pack torrent matching.
     """
     library_names = set()
+    season_packs = set()
 
     if sonarr_client.is_configured():
         try:
-            sonarr_names = fetch_sonarr_library_names(sonarr_client, log)
+            sonarr_names, sonarr_season_packs = fetch_sonarr_library_names(sonarr_client, log)
             library_names.update(sonarr_names)
-            log.info("Fetched Sonarr library scene names: count=%d", len(sonarr_names))
+            season_packs.update(sonarr_season_packs)
+            log.info(
+                "Fetched Sonarr library scene names: count=%d season_packs=%d",
+                len(sonarr_names),
+                len(sonarr_season_packs),
+            )
         except Exception as e:
             log.warning("Failed to fetch Sonarr library names: %s", e)
 
@@ -399,7 +451,8 @@ def get_current_library_names(sonarr_client, radarr_client, log):
         except Exception as e:
             log.warning("Failed to fetch Radarr library names: %s", e)
 
-    return library_names
+    return {"names": library_names, "season_packs": season_packs}
+
 
 
 def get_known_download_ids(config, state_store, sonarr_client, radarr_client, log):
@@ -435,7 +488,31 @@ def get_known_download_ids(config, state_store, sonarr_client, radarr_client, lo
     return known_ids
 
 
-def should_delete_torrent(torrent, properties, known_download_ids, library_names, ratio_limit, seeding_time_limit_seconds):
+def library_match_reason(normalized_torrent_name, library):
+    """Determine exactly why a torrent is considered present in the library, for diagnostics.
+
+    Returns a human-readable reason string, or None if no library match was found.
+    """
+    if not normalized_torrent_name:
+        return None
+
+    if normalized_torrent_name in library["names"]:
+        return "exact scene-name match"
+
+    season_pack_match = torrent_matches_season_pack(normalized_torrent_name, library["season_packs"])
+    if season_pack_match:
+        series_title, season_number = season_pack_match
+        return f"season-pack match (series='{series_title}', season={season_number})"
+
+    return None
+
+
+def torrent_in_library(normalized_torrent_name, library):
+    """Check if a torrent's normalized name matches the current Sonarr/Radarr library."""
+    return library_match_reason(normalized_torrent_name, library) is not None
+
+
+def should_delete_torrent(torrent, properties, known_download_ids, library, ratio_limit, seeding_time_limit_seconds):
     torrent_hash = (torrent.get("hash") or "").lower()
     torrent_name = torrent.get("name", "<unnamed>")
 
@@ -443,11 +520,12 @@ def should_delete_torrent(torrent, properties, known_download_ids, library_names
         return False, f"torrent {torrent_name} missing hash"
 
     if torrent_hash in known_download_ids:
-        return False, f"torrent {torrent_name} still tracked by Sonarr/Radarr"
+        return False, f"torrent {torrent_name} still tracked by Sonarr/Radarr (active queue)"
 
     normalized_torrent_name = normalize_release_name(torrent_name)
-    if normalized_torrent_name and normalized_torrent_name in library_names:
-        return False, f"torrent {torrent_name} still present in Sonarr/Radarr library"
+    match_reason = library_match_reason(normalized_torrent_name, library)
+    if match_reason:
+        return False, f"torrent {torrent_name} still present in Sonarr/Radarr library: {match_reason}"
 
     ratio = properties.get("share_ratio")
     seeding_time = properties.get("seeding_time")
@@ -464,8 +542,9 @@ def should_delete_torrent(torrent, properties, known_download_ids, library_names
 
 
 def run(config):
+    log_level = os.environ.get("LOG_LEVEL", "INFO").strip().upper()
     logging.basicConfig(
-        level=logging.INFO,
+        level=getattr(logging, log_level, logging.INFO),
         format="[torrent-tidy] %(asctime)s %(levelname)s %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
@@ -505,7 +584,7 @@ def run(config):
             known_download_ids = get_known_download_ids(
                 config, state_store, sonarr_client, radarr_client, log
             )
-            library_names = get_current_library_names(sonarr_client, radarr_client, log)
+            library = get_current_library_names(sonarr_client, radarr_client, log)
 
             torrent_list = qb_client.with_reauth(qb_client.get_torrent_list)
             if torrent_list is None:
@@ -543,15 +622,24 @@ def run(config):
                     torrent,
                     properties,
                     known_download_ids,
-                    library_names,
+                    library,
                     config.ratio_limit,
                     config.seeding_time_limit_seconds,
                 )
                 processed += 1
 
                 normalized_name = normalize_release_name(torrent.get("name", ""))
-                is_tracked = torrent_hash in known_download_ids or (
-                    normalized_name and normalized_name in library_names
+                is_tracked = torrent_hash in known_download_ids or torrent_in_library(
+                    normalized_name, library
+                )
+
+                log.debug(
+                    "Classification: %s (%s) category=%s tracked=%s reason=%s",
+                    torrent.get("name", "<unnamed>"),
+                    torrent_hash,
+                    torrent.get("category"),
+                    is_tracked,
+                    reason,
                 )
 
                 if is_tracked:
@@ -602,7 +690,7 @@ def run(config):
                 "Cycle complete: processed=%d known_ids_total=%d library_names_total=%d tracked=%d orphaned=%d orphan_under_limits=%d orphan_over_limits=%d candidates=%d",
                 processed,
                 len(known_download_ids),
-                len(library_names),
+                len(library["names"]),
                 tracked_count,
                 orphan_count,
                 orphan_under_limits_count,
