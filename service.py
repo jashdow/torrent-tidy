@@ -403,63 +403,32 @@ def get_current_library_names(sonarr_client, radarr_client, log):
 
 
 def get_known_download_ids(config, state_store, sonarr_client, radarr_client, log):
+    """Return download IDs currently in the Sonarr/Radarr active queue (downloading/importing).
+
+    This intentionally only covers the queue, not Arr history. History-based reconciliation
+    proved unreliable (delete events can omit downloadId, causing over-inclusion) and is
+    superseded by the direct library scene-name comparison in get_current_library_names.
+    Queue tracking is still useful here to avoid deleting a torrent that is mid-import.
+    """
     known_ids = set()
 
     if sonarr_client.is_configured():
         try:
             sonarr_queue_ids = paged_download_ids(sonarr_client, config.history_page_size)
-            sonarr_history_ids = sync_history_state(
-                "sonarr",
-                sonarr_client,
-                state_store,
-                config.history_page_size,
-                config.history_max_pages,
-                config.history_since_overlap_seconds,
-                log,
-            )
-            sonarr_removed_ids = reconcile_state_with_library(
-                "sonarr", sonarr_client, state_store, log
-            )
-            sonarr_history_ids = sonarr_history_ids.difference(sonarr_removed_ids)
-            sonarr_ids = sonarr_queue_ids.union(sonarr_history_ids)
-            known_ids.update(sonarr_ids)
-            log.info(
-                "Fetched Sonarr IDs: queue=%d history_active=%d total=%d",
-                len(sonarr_queue_ids),
-                len(sonarr_history_ids),
-                len(sonarr_ids),
-            )
+            known_ids.update(sonarr_queue_ids)
+            log.info("Fetched Sonarr queue IDs: count=%d", len(sonarr_queue_ids))
         except Exception as e:
-            log.warning("Failed to fetch Sonarr IDs: %s", e)
+            log.warning("Failed to fetch Sonarr queue IDs: %s", e)
     else:
         log.info("Sonarr not configured; skipping Sonarr check")
 
     if radarr_client.is_configured():
         try:
             radarr_queue_ids = paged_download_ids(radarr_client, config.history_page_size)
-            radarr_history_ids = sync_history_state(
-                "radarr",
-                radarr_client,
-                state_store,
-                config.history_page_size,
-                config.history_max_pages,
-                config.history_since_overlap_seconds,
-                log,
-            )
-            radarr_removed_ids = reconcile_state_with_library(
-                "radarr", radarr_client, state_store, log
-            )
-            radarr_history_ids = radarr_history_ids.difference(radarr_removed_ids)
-            radarr_ids = radarr_queue_ids.union(radarr_history_ids)
-            known_ids.update(radarr_ids)
-            log.info(
-                "Fetched Radarr IDs: queue=%d history_active=%d total=%d",
-                len(radarr_queue_ids),
-                len(radarr_history_ids),
-                len(radarr_ids),
-            )
+            known_ids.update(radarr_queue_ids)
+            log.info("Fetched Radarr queue IDs: count=%d", len(radarr_queue_ids))
         except Exception as e:
-            log.warning("Failed to fetch Radarr IDs: %s", e)
+            log.warning("Failed to fetch Radarr queue IDs: %s", e)
     else:
         log.info("Radarr not configured; skipping Radarr check")
 
