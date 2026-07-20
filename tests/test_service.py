@@ -47,6 +47,7 @@ def test_skips_when_still_tracked(torrent):
         torrent=torrent,
         properties={"share_ratio": 10.0, "seeding_time": 999999},
         known_download_ids={"abc123"},
+        library_names=set(),
         ratio_limit=2.0,
         seeding_time_limit_seconds=720 * 3600,
     )
@@ -55,11 +56,26 @@ def test_skips_when_still_tracked(torrent):
     assert "still tracked" in reason
 
 
+def test_skips_when_still_present_in_library(torrent):
+    should_delete, reason = should_delete_torrent(
+        torrent=torrent,
+        properties={"share_ratio": 10.0, "seeding_time": 999999},
+        known_download_ids=set(),
+        library_names={"example torrent"},
+        ratio_limit=2.0,
+        seeding_time_limit_seconds=720 * 3600,
+    )
+
+    assert not should_delete
+    assert "still present in Sonarr/Radarr library" in reason
+
+
 def test_deletes_when_orphaned_and_ratio_limit_reached(torrent):
     should_delete, reason = should_delete_torrent(
         torrent=torrent,
         properties={"share_ratio": 2.1, "seeding_time": 60},
         known_download_ids=set(),
+        library_names=set(),
         ratio_limit=2.0,
         seeding_time_limit_seconds=720 * 3600,
     )
@@ -73,6 +89,7 @@ def test_deletes_when_orphaned_and_time_limit_reached(torrent):
         torrent=torrent,
         properties={"share_ratio": 0.1, "seeding_time": 720 * 3600},
         known_download_ids=set(),
+        library_names=set(),
         ratio_limit=2.0,
         seeding_time_limit_seconds=720 * 3600,
     )
@@ -86,6 +103,7 @@ def test_keeps_when_orphaned_but_under_limits(torrent):
         torrent=torrent,
         properties={"share_ratio": 1.0, "seeding_time": 100},
         known_download_ids=set(),
+        library_names=set(),
         ratio_limit=2.0,
         seeding_time_limit_seconds=720 * 3600,
     )

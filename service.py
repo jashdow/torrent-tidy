@@ -1,4 +1,6 @@
 import logging
+import os
+import re
 import time
 import urllib.parse
 from datetime import datetime, timezone
@@ -99,7 +101,7 @@ def paged_download_ids(arr_client, page_size):
     return download_ids
 
 
-def history_bootstrap_state(arr_client, page_size, max_pages):
+def history_bootstrap_state(app_name, arr_client, page_size, max_pages):
     latest_event_by_id = {}
     latest_title_by_id = {}
     latest_entities_by_id = {}
@@ -134,8 +136,7 @@ def history_bootstrap_state(arr_client, page_size, max_pages):
 
             latest_event_by_id[download_id] = (record.get("eventType") or "").strip().lower()
             latest_title_by_id[download_id] = normalize_source_title(record.get("sourceTitle"))
-            # App-specific entity extraction runs in incremental sync where app_name is known.
-            latest_entities_by_id[download_id] = set()
+            latest_entities_by_id[download_id] = extract_arr_entity_keys(record, app_name)
 
         total_records = payload.get("totalRecords") if isinstance(payload, dict) else None
         if total_records is not None and page * page_size >= total_records:
@@ -168,10 +169,9 @@ def sync_history_state(app_name, arr_client, state_store, page_size, max_pages, 
 
     if last_event_time <= 0:
         active_ids, active_sources, active_entities, max_event_time = history_bootstrap_state(
+            app_name,
             arr_client, page_size, max_pages
         )
-        # Backfill entity keys from a light incremental pull to avoid wide bootstrap changes.
-        # On first run this is acceptable and keeps state format consistent.
         state_store.write_state(app_name, active_ids, active_sources, max_event_time)
         log.info("Bootstrapped %s history: active_ids=%d", app_name, len(active_ids))
         return active_ids
@@ -235,6 +235,173 @@ def sync_history_state(app_name, arr_client, state_store, page_size, max_pages, 
     return active_ids
 
 
+def fetch_library_entity_keys(app_name, arr_client):
+    """Fetch currently existing Arr library entity IDs for reconciliation."""
+    keys = set()
+
+    if app_name == "sonarr":
+        payload = arr_client.fetch_json("/series")
+        records = payload if isinstance(payload, list) else []
+        for record in records:
+            series_id = record.get("id")
+            if isinstance(series_id, int):
+                keys.add(f"series:{series_id}")
+    elif app_name == "radarr":
+        payload = arr_client.fetch_json("/movie")
+        records = payload if isinstance(payload, list) else []
+        for record in records:
+            movie_id = record.get("id")
+            if isinstance(movie_id, int):
+                keys.add(f"movie:{movie_id}")
+
+    return keys
+
+
+def reconcile_state_with_library(app_name, arr_client, state_store, log):
+    """Drop tracked downloads whose primary Arr entity no longer exists in library."""
+    if app_name not in ("sonarr", "radarr"):
+        return set()
+
+    existing_entity_keys = fetch_library_entity_keys(app_name, arr_client)
+    active_ids = state_store.get_active_ids(app_name)
+    active_sources = state_store.get_active_source_titles(app_name)
+    active_entities = state_store.get_active_entities(app_name)
+    last_event_time = state_store.get_last_event_time(app_name)
+
+    removed_ids = set()
+    relevant_prefix = "series:" if app_name == "sonarr" else "movie:"
+
+    for download_id, entity_keys in list(active_entities.items()):
+        relevant_keys = {k for k in entity_keys if k.startswith(relevant_prefix)}
+        if not relevant_keys:
+            continue
+        if relevant_keys.intersection(existing_entity_keys):
+            continue
+
+        removed_ids.add(download_id)
+        active_ids.discard(download_id)
+        active_sources.pop(download_id, None)
+        active_entities.pop(download_id, None)
+
+    if removed_ids:
+        state_store.write_state(
+            app_name,
+            active_ids,
+            active_sources,
+            last_event_time,
+            active_entities,
+        )
+        log.info(
+            "Reconciled %s state with library: removed=%d missing_entity_downloads",
+            app_name,
+            len(removed_ids),
+        )
+
+    return removed_ids
+
+
+def normalize_release_name(name):
+    """Normalize a torrent/release name for fuzzy comparison against Arr sceneName values."""
+    if not name:
+        return ""
+
+    value = str(name).strip().lower()
+    value = re.sub(r"\.(mkv|mp4|avi|m4v|ts|wmv|mov)$", "", value)
+    value = re.sub(r"[\.\_]+", " ", value)
+    value = re.sub(r"\s+", " ", value)
+    return value.strip()
+
+
+def scene_name_from_file_record(file_record):
+    scene_name = file_record.get("sceneName")
+    if scene_name:
+        return scene_name
+
+    relative_path = file_record.get("relativePath") or file_record.get("path") or ""
+    return os.path.splitext(os.path.basename(relative_path))[0]
+
+
+def fetch_sonarr_library_names(arr_client, log):
+    """Fetch scene names for every episode file currently in the Sonarr library."""
+    names = set()
+
+    try:
+        series_payload = arr_client.fetch_json("/series")
+    except Exception as e:
+        log.warning("Failed to fetch Sonarr series list: %s", e)
+        return names
+
+    series_list = series_payload if isinstance(series_payload, list) else []
+    for series in series_list:
+        series_id = series.get("id")
+        if not isinstance(series_id, int):
+            continue
+
+        try:
+            files_payload = arr_client.fetch_json(f"/episodefile?seriesId={series_id}")
+        except Exception as e:
+            log.warning("Failed to fetch Sonarr episode files for series %s: %s", series_id, e)
+            continue
+
+        files = files_payload if isinstance(files_payload, list) else []
+        for file_record in files:
+            normalized = normalize_release_name(scene_name_from_file_record(file_record))
+            if normalized:
+                names.add(normalized)
+
+    return names
+
+
+def fetch_radarr_library_names(arr_client, log):
+    """Fetch scene names for every movie file currently in the Radarr library."""
+    names = set()
+
+    try:
+        movie_payload = arr_client.fetch_json("/movie")
+    except Exception as e:
+        log.warning("Failed to fetch Radarr movie list: %s", e)
+        return names
+
+    movies = movie_payload if isinstance(movie_payload, list) else []
+    for movie in movies:
+        movie_file = movie.get("movieFile")
+        if not isinstance(movie_file, dict):
+            continue
+
+        normalized = normalize_release_name(scene_name_from_file_record(movie_file))
+        if normalized:
+            names.add(normalized)
+
+    return names
+
+
+def get_current_library_names(sonarr_client, radarr_client, log):
+    """Fetch a fresh snapshot of release names currently present in the Sonarr/Radarr library.
+
+    This is a direct, stateless comparison against current library contents, and does not
+    depend on hardlinks or Arr history events, both of which have proven unreliable.
+    """
+    library_names = set()
+
+    if sonarr_client.is_configured():
+        try:
+            sonarr_names = fetch_sonarr_library_names(sonarr_client, log)
+            library_names.update(sonarr_names)
+            log.info("Fetched Sonarr library scene names: count=%d", len(sonarr_names))
+        except Exception as e:
+            log.warning("Failed to fetch Sonarr library names: %s", e)
+
+    if radarr_client.is_configured():
+        try:
+            radarr_names = fetch_radarr_library_names(radarr_client, log)
+            library_names.update(radarr_names)
+            log.info("Fetched Radarr library scene names: count=%d", len(radarr_names))
+        except Exception as e:
+            log.warning("Failed to fetch Radarr library names: %s", e)
+
+    return library_names
+
+
 def get_known_download_ids(config, state_store, sonarr_client, radarr_client, log):
     known_ids = set()
 
@@ -250,6 +417,10 @@ def get_known_download_ids(config, state_store, sonarr_client, radarr_client, lo
                 config.history_since_overlap_seconds,
                 log,
             )
+            sonarr_removed_ids = reconcile_state_with_library(
+                "sonarr", sonarr_client, state_store, log
+            )
+            sonarr_history_ids = sonarr_history_ids.difference(sonarr_removed_ids)
             sonarr_ids = sonarr_queue_ids.union(sonarr_history_ids)
             known_ids.update(sonarr_ids)
             log.info(
@@ -275,6 +446,10 @@ def get_known_download_ids(config, state_store, sonarr_client, radarr_client, lo
                 config.history_since_overlap_seconds,
                 log,
             )
+            radarr_removed_ids = reconcile_state_with_library(
+                "radarr", radarr_client, state_store, log
+            )
+            radarr_history_ids = radarr_history_ids.difference(radarr_removed_ids)
             radarr_ids = radarr_queue_ids.union(radarr_history_ids)
             known_ids.update(radarr_ids)
             log.info(
@@ -291,7 +466,7 @@ def get_known_download_ids(config, state_store, sonarr_client, radarr_client, lo
     return known_ids
 
 
-def should_delete_torrent(torrent, properties, known_download_ids, ratio_limit, seeding_time_limit_seconds):
+def should_delete_torrent(torrent, properties, known_download_ids, library_names, ratio_limit, seeding_time_limit_seconds):
     torrent_hash = (torrent.get("hash") or "").lower()
     torrent_name = torrent.get("name", "<unnamed>")
 
@@ -300,6 +475,10 @@ def should_delete_torrent(torrent, properties, known_download_ids, ratio_limit, 
 
     if torrent_hash in known_download_ids:
         return False, f"torrent {torrent_name} still tracked by Sonarr/Radarr"
+
+    normalized_torrent_name = normalize_release_name(torrent_name)
+    if normalized_torrent_name and normalized_torrent_name in library_names:
+        return False, f"torrent {torrent_name} still present in Sonarr/Radarr library"
 
     ratio = properties.get("share_ratio")
     seeding_time = properties.get("seeding_time")
@@ -357,6 +536,7 @@ def run(config):
             known_download_ids = get_known_download_ids(
                 config, state_store, sonarr_client, radarr_client, log
             )
+            library_names = get_current_library_names(sonarr_client, radarr_client, log)
 
             torrent_list = qb_client.with_reauth(qb_client.get_torrent_list)
             if torrent_list is None:
@@ -394,12 +574,18 @@ def run(config):
                     torrent,
                     properties,
                     known_download_ids,
+                    library_names,
                     config.ratio_limit,
                     config.seeding_time_limit_seconds,
                 )
                 processed += 1
 
-                if torrent_hash in known_download_ids:
+                normalized_name = normalize_release_name(torrent.get("name", ""))
+                is_tracked = torrent_hash in known_download_ids or (
+                    normalized_name and normalized_name in library_names
+                )
+
+                if is_tracked:
                     tracked_count += 1
                 else:
                     orphan_count += 1
@@ -444,9 +630,10 @@ def run(config):
                     log.warning("Failed to delete %s (%s): %s", name, torrent_hash, e)
 
             log.info(
-                "Cycle complete: processed=%d known_ids_total=%d tracked=%d orphaned=%d orphan_under_limits=%d orphan_over_limits=%d candidates=%d",
+                "Cycle complete: processed=%d known_ids_total=%d library_names_total=%d tracked=%d orphaned=%d orphan_under_limits=%d orphan_over_limits=%d candidates=%d",
                 processed,
                 len(known_download_ids),
+                len(library_names),
                 tracked_count,
                 orphan_count,
                 orphan_under_limits_count,
